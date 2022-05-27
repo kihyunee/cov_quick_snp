@@ -27,8 +27,18 @@ tar -xzf package_v1.tar.gz
 cd package_v1/
 ```
 
-Otherwise, go to `package_v1` directory and run the following installation script.
+Otherwise, go to `package_v1` directory and run the installation script `INITIAL_INSTALL_once.sh`
 
+```
+chmod 755 INITIAL_INSTALL_once.sh
+
+./INITIAL_INSTALL_once.sh
+
+source ~/.bashrc
+```
+
+
+The contents of `INITIAL_INSTALL_once.sh` is like this:
 
 ```
 COV_PKG_BASE=$(pwd)
