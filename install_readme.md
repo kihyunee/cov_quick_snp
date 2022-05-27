@@ -71,9 +71,11 @@ export PATH=\$PATH:${COV_PKG_BASE}/dependency/bin
 
 if [ -f ~/.bashrc ]; then
   echo "export PATH=\$PATH:${COV_PKG_BASE}/dependency/bin" >> ~/.bashrc
+  echo "export COV_PKG_BASE=${COV_PKG_BASE}" >> >> ~/.bashrc
 fi
 if [ -f ~/.bash_profile ]; then
   echo "export PATH=\$PATH:${COV_PKG_BASE}/dependency/bin" >> ~/.bash_profile
+  echo "export COV_PKG_BASE=${COV_PKG_BASE}" >> >> ~/.bash_profile
 fi
 ```
 
