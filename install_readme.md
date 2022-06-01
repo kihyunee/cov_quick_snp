@@ -19,6 +19,13 @@ sudo apt-get install -y libncurses5-dev
 ```
 
 
+Also install R for visualization script to work.
+
+```
+sudo apt-get install ????
+```
+
+
 If you have not extracted the `package_v1.tar.gz` yet, do this.
 
 ```
@@ -77,5 +84,17 @@ if [ -f ~/.bash_profile ]; then
   echo "export PATH=\$PATH:${COV_PKG_BASE}/dependency/bin" >> ~/.bash_profile
   echo "export COV_PKG_BASE=${COV_PKG_BASE}" >> ~/.bash_profile
 fi
+```
+
+
+If you get ^M related error when you execute `quick_cov_mutation` 
+there is a solution like this:
+
+```
+cd scripts/
+
+sed -i 's/\r$//' quick_cov_mutation
+
+cp quick_cov_mutation ../dependency/bin/
 ```
 
