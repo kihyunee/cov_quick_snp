@@ -87,14 +87,14 @@ fi
 ```
 
 
-If you get ^M related error when you execute `quick_cov_mutation` 
+If you get ^M related error when you execute `quick_corona_mutation` 
 there is a solution like this:
 
 ```
 cd scripts/
 
-sed -i 's/\r$//' quick_cov_mutation
+sed -i 's/\r$//' quick_corona_mutation
 
-cp quick_cov_mutation ../dependency/bin/
+cp quick_corona_mutation ../dependency/bin/
 ```
 
