@@ -22,7 +22,12 @@ sudo apt-get install -y libncurses5-dev
 Also install R for visualization script to work.
 
 ```
-sudo apt-get install ????
+sudo apt install r-base-core
+```
+
+Inside R, install the necessary package, the only one is `ggplot2`
+```
+install.packages("ggplot2")
 ```
 
 
