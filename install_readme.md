@@ -25,9 +25,17 @@ Also install R for visualization script to work.
 sudo apt install r-base-core
 ```
 
-Inside R, install the necessary package, the only one is `ggplot2`
+Inside R, install the two necessary packages.
+
+Go to R interface by
 ```
-install.packages("ggplot2")
+sudo R
+```
+
+and install them.
+
+```
+install.packages(c("RColorBrewer", "ggplot2"))
 ```
 
 
