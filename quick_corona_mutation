@@ -1,0 +1,893 @@
+#!/usr/bin/python3
+
+import os
+import argparse
+import subprocess
+from datetime import datetime
+
+
+
+"""
+Check if environment works.
+"""
+if 'COV_PKG_BASE' not in os.environ:
+    print("You don't have environmental variable 'COV_PKG_BASE'")
+    print("Add the following line to your ~/.bashrc file:")
+    print("export COV_PKG_BASE=/path/to/package_v1")
+    print("(where the /path/to/package_v1 part should be changed to the full-path to the directory 'package_v1' in your file system)")
+
+    quit()
+
+cov_package_base_dir = os.environ['COV_PKG_BASE']
+
+wuhan_ref_fasta_path = os.path.join(cov_package_base_dir, 'reference', 'reference.fasta')
+if not os.path.isfile(wuhan_ref_fasta_path):
+    print("Cannot find " + wuhan_ref_fasta_path)
+    quit()
+
+wuhan_ref_allele_path = os.path.join(cov_package_base_dir, 'reference', 'reference.position_ref_allele.tsv')
+if not os.path.isfile(wuhan_ref_allele_path):
+    print("Cannot find " + wuhan_ref_allele_path)
+    quit()
+
+std_codon_def_path = os.path.join(cov_package_base_dir, 'reference', 'standard_codon.tab')
+if not os.path.isfile(std_codon_def_path):
+    print("Cannot find " + std_codon_def_path)
+    quit()
+
+py_script_path_vcf_to_vartab = os.path.join(cov_package_base_dir, 'scripts', 'vcf_to_variant_tab.py')
+if not os.path.isfile(py_script_path_vcf_to_vartab):
+    print("Cannot find " + py_script_path_vcf_to_vartab)
+    quit()
+
+py_script_path_vartab_to_mutpro = os.path.join(cov_package_base_dir, 'scripts', 'variant_tab_to_feature_mutation_tab_V3.py')
+if not os.path.isfile(py_script_path_vartab_to_mutpro):
+    print("Cannot find " + py_script_path_vartab_to_mutpro)
+    quit()
+
+ref_nonterminal_region_file_path = os.path.join(cov_package_base_dir, 'reference', 'reference.non_terminal_regions.tab')
+if not os.path.isfile(ref_nonterminal_region_file_path):
+    print("Cannot find " + ref_nonterminal_region_file_path)
+    quit()
+
+sys_path_to_minimap = os.path.join(cov_package_base_dir, "dependency", "bin", "minimap2")
+sys_path_to_samtools = os.path.join(cov_package_base_dir, "dependency", "bin", "samtools")
+sys_path_to_bcftools = os.path.join(cov_package_base_dir, "dependency", "bin", "bcftools")
+
+
+
+"""
+internal methods
+"""
+dict_nonambig_base = {}
+dict_nonambig_base['A'] = True
+dict_nonambig_base['C'] = True
+dict_nonambig_base['G'] = True
+dict_nonambig_base['T'] = True
+dict_nonambig_base['a'] = True
+dict_nonambig_base['c'] = True
+dict_nonambig_base['g'] = True
+dict_nonambig_base['t'] = True
+
+
+def list_ambig_coord_from_singlefasta(input_fasta):
+    input_seq = ''
+    fr = open(input_fasta)
+    line = fr.readline()
+    while line != '':
+        if line.strip().startswith('>'):
+            line = fr.readline()
+            seq_l = []
+            while line != '':
+                seq_l.append(line.strip())
+                line = fr.readline()
+                if line.strip().startswith('>'):
+                    break
+            input_seq = ''.join(seq_l)
+            break
+        else:
+            line = fr.readline()
+    fr.close()
+
+    list_ambig_coord = []
+    for zbi in range(len(input_seq)):
+        if input_seq[zbi] not in dict_nonambig_base:
+            list_ambig_coord.append(zbi + 1)
+    
+    return list_ambig_coord
+
+
+def get_cigar_from_sam(input_sam):
+    cigar_str = ""
+    ref_pos = 0     # 1-based leftmost mapping POSition of the first CIGAR operation that consumes reference base
+    fr = open(input_sam, 'r')
+    for line in fr:
+        if line.strip().startswith('@'):
+            continue
+        sam_fields = line.strip().split("\t")
+        cigar_str = sam_fields[5]
+        ref_pos = int(sam_fields[3])
+        break
+    fr.close()
+    return [ref_pos, cigar_str]
+
+
+def cigar_to_elements(cigar_string):
+    list_oper = []
+    list_size = []
+    num_element = 0
+
+    buff_numeric_str = []
+    for zbi in range(len(cigar_string)):
+        zbi_char = cigar_string[zbi]
+        if zbi_char.isnumeric():
+            buff_numeric_str.append(zbi_char)
+        else:
+            operator_type = zbi_char
+            list_oper.append(operator_type)
+            list_size.append(int(''.join(buff_numeric_str)))
+            num_element += 1
+            buff_numeric_str = []
+    return [list_oper, list_size, num_element]
+
+
+def transform_to_refcoord(list_onquery_coord, ref_aln_pos, cigar_string):
+    dict_onqeury_to_onref_coord = {}
+    list_onref_coord = []
+    num_coord = len(list_onquery_coord)
+
+    for coord_idx in range(num_coord):
+        dict_onqeury_to_onref_coord[list_onquery_coord[coord_idx]] = -1
+    
+    [list_cigar_oper, list_cigar_length, num_cigar_element] = cigar_to_elements(cigar_string)
+
+    realtime_ref_pos = ref_aln_pos
+    realtime_query_pos = 1
+
+    for operation_index in range(num_cigar_element):
+        operation_type = list_cigar_oper[operation_index]
+        operation_length = list_cigar_length[operation_index]
+
+        if operation_type == 'M':
+            for walkbase in range(operation_length):
+                # this realtime position of query aligns to this realtime position of reference
+                if realtime_query_pos in dict_onqeury_to_onref_coord:
+                    # position should be recorded
+                    dict_onqeury_to_onref_coord[realtime_query_pos] = realtime_ref_pos
+                realtime_ref_pos += 1
+                realtime_query_pos += 1
+
+        elif operation_type == 'I':
+            for walkbase in range(operation_length):
+                # this realtime query position is consumed without consuming reference position
+                if realtime_query_pos in dict_onqeury_to_onref_coord:
+                    # position should not be recorded even if it's ambiguous because the query base is not used in variant call (or to add depth on ref)
+                    dict_onqeury_to_onref_coord[realtime_query_pos] = -1
+                realtime_query_pos += 1
+
+        elif operation_type == 'D':
+            for walkbase in range(operation_length):
+                # this realtime query position is not consumed while reference position does
+                realtime_ref_pos += 1
+        
+        elif operation_type == 'N':
+            for walkbase in range(operation_length):
+                # this realtime query position is not consumed while reference position does
+                realtime_ref_pos += 1
+        
+        elif operation_type == 'S':
+            for walkbase in range(operation_length):
+                # this realtime query position is consumed without consuming reference position
+                if realtime_query_pos in dict_onqeury_to_onref_coord:
+                    # position should not be recoreded even if it's ambiguous because the query base is not used in variant calling (or in adding depth on ref)
+                    dict_onqeury_to_onref_coord[realtime_query_pos] = -1
+                realtime_query_pos += 1
+
+        if operation_type == '=':
+            for walkbase in range(operation_length):
+                # this realtime position of query aligns to this realtime position of reference
+                if realtime_query_pos in dict_onqeury_to_onref_coord:
+                    # position should be recorded
+                    dict_onqeury_to_onref_coord[realtime_query_pos] = realtime_ref_pos
+                realtime_ref_pos += 1
+                realtime_query_pos += 1
+
+        if operation_type == 'X':
+            for walkbase in range(operation_length):
+                # this realtime position of query aligns to this realtime position of reference
+                if realtime_query_pos in dict_onqeury_to_onref_coord:
+                    # position should be recorded
+                    dict_onqeury_to_onref_coord[realtime_query_pos] = realtime_ref_pos
+                realtime_ref_pos += 1
+                realtime_query_pos += 1
+
+    for onquery_pos in dict_onqeury_to_onref_coord:
+        if dict_onqeury_to_onref_coord[onquery_pos] != -1:
+            list_onref_coord.append(dict_onqeury_to_onref_coord[onquery_pos])
+    
+    return list_onref_coord
+
+
+
+"""
+Specify the input samples/sequences
+1. Let user specify the list of input fasta files (each file = assembled whole genome sequence fasta, single entry per sample strain, single ~ multi entries per file)
+    - (a) Can do it by directory path
+    - (b) Can do it by a single fasta file path
+    - (c) Can do it by a file-of-file-names
+2. Let user specify the output folder which will contain individual sample mutation tables
+3. Let user specify the prefix for the output csv files: PREFIX.sample_record.csv  /  PREFIX.mutation_freq.csv  /  PREFIX.mutation_sample_list.csv  /  PREFIX.mutation_pr_ab.csv
+"""
+
+parser = argparse.ArgumentParser(description = "Specify input sequences using --input-dir or --input-fofn or --input-fasta; Specify output diretory using --output-dir")
+parser.add_argument("--input-dir", dest="input_fasta_dir", required=False, default = '_ns', type=str, help="The directory containing .fasta files; Each .fasta file contains a single SARS-CoV-2 whole genome sequence.")
+parser.add_argument("--input-fofn", dest="input_fasta_fofn", required=False, default = '_ns', type=str, help="The list of .fasta file paths; One file path per line; Each .fasta file contains a single SARS-CoV-2 whole genome sequence.")
+parser.add_argument("--input-fasta", dest="input_multifasta_file", required=False, default = '_ns', type=str, help="File path for a single fasta file, which may contain multiple entries (e.g. multiple SARS-CoV-2 whole genome sequences)")
+parser.add_argument("--gap-in-input", dest="what_to_do_with_input_gap", required=False, default = 'trim', type=str, help="default = 'trim'; Tell what to do with gap characters if they our found in input sequences: possible options are 'trim' and 'ambig'. 'trim' will remove those sites, 'ambig' will change - to N")
+parser.add_argument("--output-dir", dest="output_base_dir", required=True, type=str, help="The output directory, inside this directory we will have all final output tables")
+parser.add_argument("--csv-prefix", dest="output_csv_prefix", required=True, type=str, help="Path to the output table (csv) files")
+args = parser.parse_args()
+
+input_fasta_dir = args.input_fasta_dir
+input_fasta_fofn = args.input_fasta_fofn
+input_multifasta_file = args.input_multifasta_file
+output_base_dir = args.output_base_dir
+output_csv_prefix = args.output_csv_prefix
+what_to_do_with_input_gap = args.what_to_do_with_input_gap
+
+
+
+# Four CSV tables will be produced.
+output_csv_sample_record = output_csv_prefix + ".sample_record.csv"
+output_csv_mutation_freq = output_csv_prefix + ".mutation_freq.csv"
+output_csv_mutation_sample_list = output_csv_prefix + ".mutation_sample_list.csv"
+output_csv_mutation_pr_ab = output_csv_prefix + ".mutation_pr_ab.csv"
+
+
+input_style = 'NA'      #   can be one of ['dir', 'fofn', 'multifasta']
+if input_fasta_dir != '_ns':
+    if (input_fasta_fofn != '_ns') or (input_multifasta_file != '_ns'):
+        print("You cannot use multiple input styles; Pick and use only one of the three options (--input-dir, --input-fofn, --input-fasta)")
+        quit()
+    input_style = 'dir'
+elif input_fasta_fofn != '_ns':
+    if (input_fasta_dir != '_ns') or (input_multifasta_file != '_ns'):
+        print("You cannot use multiple input styles; Pick and use only one of the three options (--input-dir, --input-fofn, --input-fasta)")
+        quit()
+    input_style = 'fofn'
+elif input_multifasta_file != '_ns':
+    if (input_fasta_fofn != '_ns') or (input_fasta_dir != '_ns'):
+        print("You cannot use multiple input styles; Pick and use only one of the three options (--input-dir, --input-fofn, --input-fasta)")
+        quit()
+    input_style = 'multifasta'
+else:
+    print("You must use one of the three input options (--input-dir, --input-fofn, --input-fasta)")
+    quit()
+
+if (what_to_do_with_input_gap != 'trim') and (what_to_do_with_input_gap != 'ambig'):
+    print("Allowable options for --gap-in-input are [trim, ambig]")
+    quit()
+
+if not os.path.isdir(output_base_dir):
+    os.makedirs(output_base_dir)
+
+
+
+"""
+Function(s) to use later
+"""
+def depth_file_to_covered_coord(depth_f, alncovcoord_f):
+    fw = open(alncovcoord_f, 'w')
+    fr = open(depth_f, 'r')
+
+    covregion_seq_id = ''
+    covregion_start = -1
+    covregion_end = -1
+    covregion_depth = -1
+
+    for line in fr:
+        fields = line.strip().split()
+        ref_seq_id = fields[0]
+        ref_seq_coord = int(fields[1])
+        coverage_depth = int(fields[2])
+
+        # if first,
+        if covregion_start == -1 and covregion_end == -1:
+            covregion_seq_id = ref_seq_id
+            covregion_start = ref_seq_coord
+            covregion_depth = coverage_depth
+            covregion_end = ref_seq_coord
+        # if ref sequence ended and started new 
+        elif ref_seq_id != covregion_seq_id:
+            # it's time to report and
+            fw.write(covregion_seq_id + "\t" + str(covregion_start) + "\t" + str(covregion_end) + "\t" + str(covregion_depth) + "\n")
+
+            # start new
+            covregion_seq_id = ref_seq_id
+            covregion_start = ref_seq_coord
+            covregion_depth = coverage_depth
+        # if coverage depth shifted from >0 to 0 or 0 to >0
+        elif (covregion_depth == 0 and coverage_depth > 0) or (covregion_depth > 0 and coverage_depth == 0):
+            # it's time to report and
+            fw.write(covregion_seq_id + "\t" + str(covregion_start) + "\t" + str(covregion_end) + "\t" + str(covregion_depth) + "\n")
+
+            # start new
+            covregion_seq_id = ref_seq_id
+            covregion_start = ref_seq_coord
+            covregion_depth = coverage_depth
+        # otherwise the continuation of the status quo, just update the ending coordinate
+        else:
+            covregion_end = ref_seq_coord
+    fw.write(covregion_seq_id + "\t" + str(covregion_start) + "\t" + str(covregion_end) + "\t" + str(covregion_depth) + "\n")
+    fw.close()
+    fr.close()
+
+
+
+"""
+First we collect the input fasta files: collect both (a) full paths and (b) just file names
+"""
+list_input_fasta_path = []
+list_input_fasta_file_name = []     # the last part of the file name excluding upper layer path and the .fasta extension
+
+if input_style == 'dir':
+    input_dir_filename_list = os.listdir(input_fasta_dir)
+    for filename in input_dir_filename_list:
+        if filename.endswith('.fasta') or filename.endswith('.fa') or filename.endswith('.fas') or filename.endswith('.fna') or filename.endswith('.seq'):
+            input_fasta_path = os.path.join(input_fasta_dir, filename)
+            input_fasta_file_name = filename[:filename.rfind('.')]
+            list_input_fasta_path.append(input_fasta_path)
+            list_input_fasta_file_name.append(input_fasta_file_name)
+elif input_style == 'fofn':
+    was_any_file_not_found = False
+    fr = open(input_fasta_fofn, 'r')
+    for line in fr:
+        input_fasta_path = line.strip()
+        filename = input_fasta_path
+        if input_fasta_path.find('/') != -1:
+            filename = input_fasta_path[input_fasta_path.rfind('/') + 1:]
+        input_fasta_file_name = filename[:filename.rfind('.')]
+
+        if os.path.isfile(input_fasta_path):
+            list_input_fasta_path.append(input_fasta_path)
+            list_input_fasta_file_name.append(input_fasta_file_name)
+        else:
+            print("File path does not exist: " + input_fasta_path)
+            was_any_file_not_found = True
+    fr.close()
+    if was_any_file_not_found:
+        print("  ... Go back and check the file paths you gave inside the fofn file: --input-fofn option " + input_fasta_fofn)
+        quit()
+else:
+    # input_style == 'multifasta'
+    if os.path.isfile(input_multifasta_file):
+        input_fasta_path = input_multifasta_file
+        filename = input_fasta_path
+        if input_fasta_path.find('/') != -1:
+            filename = input_fasta_path[input_fasta_path.rfind('/') + 1:]
+        
+        input_fasta_file_name = filename[:filename.rfind('.')]
+
+        list_input_fasta_path.append(input_fasta_path)
+        list_input_fasta_file_name.append(input_fasta_file_name)
+
+num_input_fasta = len(list_input_fasta_path)
+print("Received " + str(num_input_fasta) + " input fasta files from input arguments")
+
+
+
+"""
+Second, from the fasta files, we collect the list of input sample names. Normally one input fasta file will contain one sample, so there will not be a difference between
+the list of fasta files and the list of samples. But to cover the cases where the user potentially placed many samples into a single fasta file, we separate the two concepts.
+
+Also write the temporary fasta files which are now guaranteed to be sample-specific.
+"""
+list_input_sample_systematic_id = []
+list_input_sample_original_id = []
+list_input_sample_tmpfasta = []
+dict_sample_sysid_fasta_file_name = {}
+dict_sample_sysid_fasta_file_path = {}
+list_sample_output_path_prefix = []
+
+tmp_input_fastas_dir = output_base_dir + '__tmpfasta'
+if not os.path.isdir(tmp_input_fastas_dir):
+    os.makedirs(tmp_input_fastas_dir)
+
+for input_fa_idx in range(num_input_fasta):
+    input_fasta_path = list_input_fasta_path[input_fa_idx]
+    input_fasta_file_name = list_input_fasta_file_name[input_fa_idx]
+    sysid_appendix = 0
+
+    fr = open(input_fasta_path, 'r')
+    line = fr.readline()
+    while line != '':
+        if line.strip().startswith('>'):
+            seqid = line.strip()[1:]
+            seq_str_l = []
+            line = fr.readline()
+            while line != '':
+                seq_str_l.append(line.strip())
+                line = fr.readline()
+                if line.strip().startswith('>'):
+                    break
+            #
+            sysid_appendix += 1
+            sample_systematic_id = input_fasta_file_name + '__entry.' + str(sysid_appendix)
+            sample_original_id = seqid
+            tmp_fasta_path = os.path.join(tmp_input_fastas_dir, sample_systematic_id + '.fasta')
+
+            output_path_prefix = os.path.join(output_base_dir, sample_systematic_id)
+
+            list_input_sample_systematic_id.append(sample_systematic_id)
+            list_input_sample_original_id.append(sample_original_id)
+            list_input_sample_tmpfasta.append(tmp_fasta_path)
+            dict_sample_sysid_fasta_file_name[sample_systematic_id] = input_fasta_file_name
+            dict_sample_sysid_fasta_file_path[sample_systematic_id] = input_fasta_path
+            list_sample_output_path_prefix.append(output_path_prefix)
+
+            fw = open(tmp_fasta_path, 'w')
+            fw.write(">" + sample_systematic_id + "\n")
+            seq_str = ''.join(seq_str_l)
+            gap_treated_seq = seq_str
+            if seq_str.find('-') != -1:
+                gap_treated_seq_l = []
+                for basezbi in range(len(seq_str)):
+                    base = seq_str[basezbi]
+                    if base == '-':
+                        if what_to_do_with_input_gap == 'ambig':
+                            gap_treated_seq_l.append('N')
+                    else:
+                        gap_treated_seq_l.append(base)
+                gap_treated_seq = ''.join(gap_treated_seq_l)
+            fw.write(gap_treated_seq + "\n")
+            fw.close()
+        else:
+            line = fr.readline()
+    fr.close()
+
+num_sample = len(list_input_sample_systematic_id)
+print("Found " + str(num_sample) + " samples from the received fasta file(s)")
+
+
+
+
+"""
+Workflow per input sample sequence
+	minimap2 -a -o ${output_aln}/${sample_pre}.sam -x asm20 package_v1/reference/reference.fasta ${fasta_file}
+	samtools view -S -b -o ${output_aln}/${sample_pre}.bam ${output_aln}/${sample_pre}.sam
+	samtools sort -o ${output_aln}/${sample_pre}.sorted.bam ${output_aln}/${sample_pre}.bam
+	samtools index ${output_aln}/${sample_pre}.sorted.bam
+	
+    >previously: samtools mpileup -u -f package_v1/reference/reference.fasta -o ${output_aln}/${sample_pre}.bcf ${output_aln}/${sample_pre}.sorted.bam
+    >but now:
+    bcftools mpileup -f package_v1/reference/reference.fasta -o ${output_aln}/${sample_pre}.bcf -Ou ${output_aln}/${sample_pre}.sorted.bam
+	
+    bcftools view -c 0 -v snps,indels,mnps -o ${output_var}/${sample_pre}.vcf -Ov ${output_aln}/${sample_pre}.bcf
+	python package_v1/scripts/vcf_to_variant_tab.py --vcf ${output_var}/${sample_pre}.vcf --qid ${sample_pre} --out ${output_var}/${sample_pre}.var.tab
+	python package_v1/scripts/variant_tab_to_feature_mutation_tab_V3.py --var ${output_var}/${sample_pre}.var.tab --ref package_v1/reference/reference.position_ref_allele.tsv --out ${output_mut}/${sample_pre}.mutation_profile.tab --codon package_v1/reference/standard_codon.tab
+"""
+
+
+
+#  Recording sample processing log in real-time:
+#   sample original ID / sample systematic ID / input file filename / input file path / result mutation profile table path / date-time of processing this
+fw = open(output_csv_sample_record, 'w')
+fw.write('"sample_original_ID","sample_sytematic_ID","input_fasta_filename","input_fasta_path","output_mutation_table_path","date-time-of-processing"' + "\n")
+
+
+for sampleidx in range(num_sample):
+    n_th_sample = sampleidx + 1
+    print("###################################################################")
+    print(" Starting on " + str(n_th_sample) + " / " + str(num_sample) + " sample")
+    print("###################################################################")
+
+    sample_systematic_id = list_input_sample_systematic_id[sampleidx]
+    sample_original_id = list_input_sample_original_id[sampleidx]
+    sample_tmpfasta = list_input_sample_tmpfasta[sampleidx]
+    sample_input_file_path = dict_sample_sysid_fasta_file_path[sample_systematic_id]
+    sample_input_file_name = dict_sample_sysid_fasta_file_name[sample_systematic_id]
+    sample_output_prefix = list_sample_output_path_prefix[sampleidx]
+    sample_output_sam_tmp = sample_output_prefix + '.sam'
+    sample_output_bam_tmp = sample_output_prefix + '.bam'
+    sample_output_sbam_tmp = sample_output_prefix + '.sorted.bam'
+    sample_output_depth_tmp = sample_output_prefix + '.depth'
+    sample_output_bcf_tmp = sample_output_prefix + '.bcf'
+    sample_output_vcf_tmp = sample_output_prefix + '.vcf'
+    sample_output_vartab_tmp = sample_output_prefix + '.vartab'
+    sample_output_mutpro = sample_output_prefix + '.quick_mut.tsv'
+    sample_output_alncovcoord = sample_output_prefix + '.quick_mut.cov'
+    new_sample_output_ambig_basecall_coord = sample_output_prefix + '.quick_mut.ambigpos'
+    time_of_processing = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    can_skip = False
+    if os.path.isfile(sample_output_mutpro):
+        can_skip = True
+        print("Result exists for " + sample_systematic_id)
+        time_of_processing = "PREVIOUSLY PROCESSED"
+
+    fw.write('"' + sample_original_id + '","' + sample_systematic_id + '","' + sample_input_file_name + '","' + os.path.abspath(sample_input_file_path))
+    fw.write('","' + os.path.abspath(sample_output_mutpro) + '","' + time_of_processing + '"' + "\n")
+
+    if can_skip:
+        continue
+
+	# minimap2 -a -o ${output_aln}/${sample_pre}.sam -x asm20 package_v1/reference/reference.fasta ${fasta_file}
+    command_list = []
+    command_list.append(sys_path_to_minimap)
+    command_list.append('-a')
+    command_list.append('-o')
+    command_list.append(sample_output_sam_tmp)
+    command_list.append('-x')
+    command_list.append('asm20')
+    command_list.append(wuhan_ref_fasta_path)
+    command_list.append(sample_tmpfasta)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)
+
+    
+    """
+    collect the on-query coordinates of query's ambiguous bases
+    """
+    list_onquery_coord_ambig = list_ambig_coord_from_singlefasta(sample_tmpfasta)
+
+
+    """
+    based on the cigar string, transform the above into 
+    the on-reference coordinates of query's ambiguous basecalls; 
+    write the coordinates in new_sample_output_ambig_basecall_coord file
+    """
+    list_onref_coord_ambig = []
+    if len(list_onquery_coord_ambig) > 0:
+        [ref_aln_pos, cigar_string] = get_cigar_from_sam(sample_output_sam_tmp)
+        list_onref_coord_ambig = transform_to_refcoord(list_onquery_coord_ambig, ref_aln_pos, cigar_string)
+    
+    fw_ambig = open(new_sample_output_ambig_basecall_coord, 'w')
+    for coord_idx in range(len(list_onref_coord_ambig)):
+        fw_ambig.write(str(list_onref_coord_ambig[coord_idx]) + "\n")
+    fw_ambig.close()
+
+
+	# samtools view -S -b -o ${output_aln}/${sample_pre}.bam ${output_aln}/${sample_pre}.sam
+    command_list = []
+    command_list.append(sys_path_to_samtools)
+    command_list.append('view')
+    command_list.append('-S')
+    command_list.append('-b')
+    command_list.append('-o')
+    command_list.append(sample_output_bam_tmp)
+    command_list.append(sample_output_sam_tmp)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)
+
+	# samtools sort -o ${output_aln}/${sample_pre}.sorted.bam ${output_aln}/${sample_pre}.bam
+    command_list = []
+    command_list.append(sys_path_to_samtools)
+    command_list.append('sort')
+    command_list.append('-o')
+    command_list.append(sample_output_sbam_tmp)
+    command_list.append(sample_output_bam_tmp)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)
+
+	# samtools index ${output_aln}/${sample_pre}.sorted.bam
+    command_list = []
+    command_list.append(sys_path_to_samtools)
+    command_list.append('index')
+    command_list.append(sample_output_sbam_tmp)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)
+
+    # samtools depth -aa -o ${sample_pre}.depth ${sample_pre}.sorted.bam
+    command_list = []
+    command_list.append(sys_path_to_samtools)
+    command_list.append('depth')
+    command_list.append('-aa')
+    command_list.append('-o')
+    command_list.append(sample_output_depth_tmp)
+    command_list.append(sample_output_sbam_tmp)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)    
+
+    # bcftools mpileup -f package_v1/reference/reference.fasta -o ${output_aln}/${sample_pre}.bcf -Ou ${output_aln}/${sample_pre}.sorted.bam
+    command_list = []
+    command_list.append(sys_path_to_bcftools)
+    command_list.append('mpileup')
+    command_list.append('-m')
+    command_list.append('1')
+    command_list.append('-R')
+    command_list.append(ref_nonterminal_region_file_path)
+    command_list.append('-f')
+    command_list.append(wuhan_ref_fasta_path)
+    command_list.append('-o')
+    command_list.append(sample_output_bcf_tmp)
+    command_list.append('-Ou')
+    command_list.append(sample_output_sbam_tmp)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)
+
+    # bcftools view -c 0 -v snps,indels,mnps -o ${output_var}/${sample_pre}.vcf -Ov ${output_aln}/${sample_pre}.bcf
+    command_list = []
+    command_list.append(sys_path_to_bcftools)
+    command_list.append('view')
+    command_list.append('-c')
+    command_list.append('0')
+    command_list.append('-v')
+    command_list.append('snps,indels,mnps')
+    command_list.append('-o')
+    command_list.append(sample_output_vcf_tmp)
+    command_list.append(sample_output_bcf_tmp)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)
+
+	# python package_v1/scripts/vcf_to_variant_tab.py --vcf ${output_var}/${sample_pre}.vcf --qid ${sample_pre} --out ${output_var}/${sample_pre}.var.tab
+    command_list = []
+    command_list.append('python3')
+    command_list.append(py_script_path_vcf_to_vartab)
+    command_list.append('--vcf')
+    command_list.append(sample_output_vcf_tmp)
+    command_list.append('--qid')
+    command_list.append(sample_systematic_id)
+    command_list.append('--out')
+    command_list.append(sample_output_vartab_tmp)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)
+
+	# python package_v1/scripts/variant_tab_to_feature_mutation_tab_V3.py --var ${output_var}/${sample_pre}.var.tab --ref package_v1/reference/reference.position_ref_allele.tsv 
+    # --out ${output_mut}/${sample_pre}.mutation_profile.tab --codon package_v1/reference/standard_codon.tab
+    command_list = []
+    command_list.append('python3')
+    command_list.append(py_script_path_vartab_to_mutpro)
+    command_list.append('--var')
+    command_list.append(sample_output_vartab_tmp)
+    command_list.append('--ref')
+    command_list.append(wuhan_ref_allele_path)
+    command_list.append('--codon')
+    command_list.append(std_codon_def_path)
+    command_list.append('--out')
+    command_list.append(sample_output_mutpro)
+    print("RUN: " + ' '.join(command_list))
+    subprocess.run(command_list)
+
+    depth_file_to_covered_coord(sample_output_depth_tmp, sample_output_alncovcoord)
+
+    os.remove(sample_output_sam_tmp)
+    os.remove(sample_output_bam_tmp)
+    os.remove(sample_output_sbam_tmp)
+    os.remove(sample_output_sbam_tmp + '.bai')
+    os.remove(sample_output_depth_tmp)
+    os.remove(sample_output_bcf_tmp)
+    os.remove(sample_output_vcf_tmp)
+    os.remove(sample_output_vartab_tmp)
+fw.close()
+
+
+
+"""
+Clean up.
+- remove all fasta files in: list_input_sample_tmpfasta []
+- and remove this directory: tmp_input_fastas_dir
+"""
+for tmpfasta in list_input_sample_tmpfasta:
+    os.remove(tmpfasta)
+
+os.rmdir(tmp_input_fastas_dir)
+
+
+
+
+"""
+That's the end of this code's role in the V2 package.
+All the jobs below - frequency of mutations - are now 100% responsible by 'mutation_trend_table.py'
+Legacy codes are remaining below there but inactivated.
+"""
+
+quit()
+
+
+
+
+
+###########
+##########
+##########
+#########   START OF THE LEGACY FOSSILIZED CODE
+#######
+##########
+#############
+#############
+"""
+All individual samples have been processed.
+Next, create summarized mutation frequency report tables.
+
+First, collect list of mutations that were ever detected among the samples
+"""
+print("##########################################################")
+print("##########################################################")
+print("Now summarize all mutations detected throughout the input samples")
+
+
+list_mut_id = []
+list_mut_startcoord = []
+dict_mut_id_index = {}
+buff_mut_index = -1
+dict_mut_id_attribute = {}
+#   dict_mut_id_attribute:
+#   mutation_id : [genomic_from, genomic_to, feature_name, locus_type, variant_type, amino_acid_position, ref_nt_allele, alt_nt_allele, ref_aa_allele, alt_aa_allele]
+for sampleidx in range(num_sample):
+    sample_output_prefix = list_sample_output_path_prefix[sampleidx]
+    sample_output_mutpro = sample_output_prefix + '.quick_mut.tsv'
+
+    fr = open(sample_output_mutpro, 'r')
+    line = fr.readline()
+    for line in fr:
+        fields = line.strip().split("\t")
+        """
+        [0] mutation_def_code   [1] genomic_from    [2] genomic_to
+        [3] feature [4] amino_acid_position     [5] locus_type
+        [6] ref_nt_allele   [7] sample_nt_allele
+        [8] ref_aa_allele   [9] sample_aa_allele
+        [10] variant_type        
+        """
+        mut_def = fields[0]
+        genomic_from = fields[1]
+        genomic_to = fields[2]
+        feature_name = fields[3]
+        amino_position = fields[4]
+        locus_type = fields[5]
+        ref_nt = fields[6]
+        alt_nt = fields[7]
+        ref_aa = fields[8]
+        alt_aa = fields[9]
+        var_type = fields[10]
+        #
+        genomic_from_int = int(genomic_from)
+        mut_attribute = [genomic_from, genomic_to, feature_name, locus_type, var_type, amino_position, ref_nt, alt_nt, ref_aa, alt_aa]
+        #
+        if mut_def not in dict_mut_id_index:
+            buff_mut_index += 1
+            list_mut_id.append(mut_def)
+            list_mut_startcoord.append(genomic_from_int)
+            dict_mut_id_index[mut_def] = buff_mut_index
+            dict_mut_id_attribute[mut_def] = mut_attribute
+    fr.close()
+num_mut_collected = len(list_mut_id)
+print("Total " + str(num_mut_collected) + " different mutations were detected throughout the samples")
+
+
+
+"""
+- frequency across all samples by mutation
+- presence absence of each mutation in each sample
+"""
+list_mut_count_sample = [0]*num_mut_collected
+matrix_sample_mutation_presence = []
+
+for sampleidx in range(num_sample):
+    sample_output_prefix = list_sample_output_path_prefix[sampleidx]
+    sample_output_mutpro = sample_output_prefix + '.quick_mut.tsv'
+
+    list_mutation_presence = [False]*num_mut_collected
+
+    fr = open(sample_output_mutpro, 'r')
+    line = fr.readline()
+    for line in fr:
+        fields = line.strip().split("\t")
+        """
+        [0] mutation_def_code   [1] genomic_from    [2] genomic_to
+        ...
+        """
+        mut_def = fields[0]
+        mut_index = dict_mut_id_index[mut_def]
+
+        list_mut_count_sample[mut_index] += 1
+        list_mutation_presence[mut_index] = True
+    fr.close()
+
+    matrix_sample_mutation_presence.append(list_mutation_presence)
+
+
+
+"""
+sort mutations by genomic (start) position
+"""
+zipped_lists = zip(list_mut_startcoord, list_mut_id)
+sorted_pairs = sorted(zipped_lists)
+tuples = zip(*sorted_pairs)
+sorted_mut_startcoord, sorted_mut_id = [ list(tuple) for tuple in  tuples]
+
+
+"""
+write frequency table
+"""
+
+fw = open(output_csv_mutation_freq, 'w')
+fw.write('"mutation_definition","frequency_percent","n.samples.detected_in","n.samples.analyzed","genomic_from","genomic_to","coding_feature","locus_type","variant_type","amino_acid_position","ref_nt","alt_nt","ref_aa","alt_aa"')
+fw.write("\n")
+
+for sorted_mut_zbi in range(num_mut_collected):
+    mut_id = sorted_mut_id[sorted_mut_zbi]
+    mut_index = dict_mut_id_index[mut_id]
+    mut_attribute = dict_mut_id_attribute[mut_id]
+    #   mut_attribute = [genomic_from, genomic_to, feature_name, locus_type, var_type, amino_position, ref_nt, alt_nt, ref_aa, alt_aa]
+
+    num_positive_sample = list_mut_count_sample[mut_index]
+    pct_freq = float(num_positive_sample)*100/float(num_sample)
+    pct_freq_rounded = round(pct_freq, 4)
+
+    var_site_from = str(mut_attribute[0])
+    var_site_to = str(mut_attribute[1])
+    var_feature = mut_attribute[2]
+    var_locus_type = mut_attribute[3]
+    var_type = mut_attribute[4]
+    var_amino_pos = str(mut_attribute[5])
+    if mut_attribute[5] == '.':
+        var_amino_pos = 'NA'
+    var_ref_nt = mut_attribute[6]
+    var_alt_nt = mut_attribute[7]
+    var_ref_aa = mut_attribute[8]
+    var_alt_aa = mut_attribute[9]
+
+    #"mutation_definition","frequency_percent","n.samples.detected_in","n.samples.analyzed",
+    #  "genomic_from","genomic_to","coding_feature","locus_type","variant_type","amino_acid_position",
+    #  "ref_nt","alt_nt","ref_aa","alt_aa"')
+
+    fw.write('"' + mut_id + '",' + str(pct_freq_rounded) + '%' + ',' + str(num_positive_sample) + ',' + str(num_sample))
+    fw.write(','+ var_site_from + ',' + var_site_to + ',"' + var_feature + '"')
+    fw.write(',"' + var_locus_type + '","' + var_type + '",' + var_amino_pos)
+    # ref nt, alt nt, ref aa, alt aa
+    fw.write(',"' + var_ref_nt + '","' + var_alt_nt + '","' + var_ref_aa + '","' + var_alt_aa + '"')
+    fw.write("\n")
+fw.close()
+print("  ... WROTE mutation frequency summary table in: " + output_csv_mutation_freq)
+
+
+
+"""
+write presence absence matrix
+"""
+fw = open(output_csv_mutation_pr_ab, 'w')
+fw.write('"sample"')
+for sorted_mut_zbi in range(num_mut_collected):
+    mut_id = sorted_mut_id[sorted_mut_zbi]
+    fw.write(',"' + mut_id + '"')
+fw.write("\n")
+
+for sampleidx in range(num_sample):
+    sample_original_id = list_input_sample_original_id[sampleidx]
+    fw.write('"' + sample_original_id + '"')
+    for sorted_mut_zbi in range(num_mut_collected):
+        mut_id = sorted_mut_id[sorted_mut_zbi]
+        mut_index = dict_mut_id_index[mut_id]
+        present_in_sample = matrix_sample_mutation_presence[sampleidx][mut_index]
+        if present_in_sample:
+            fw.write(",1")
+        else:
+            fw.write(",0")
+    fw.write("\n")
+fw.close()
+print("  ... WROTE mutation - sample presence absence matrix in: " + output_csv_mutation_pr_ab)
+
+
+"""
+Write sample list per mutation
+"""
+fw = open(output_csv_mutation_sample_list, 'w')
+fw.write('"mutation definition","sample ID user provided","sample ID systematic","input file"' + "\n")
+for sorted_mut_zbi in range(num_mut_collected):
+    mut_def = sorted_mut_id[sorted_mut_zbi]
+    mut_zbi = dict_mut_id_index[mut_def]
+    list_positive_sample_index = []
+    for sampleidx in range(num_sample):
+        if matrix_sample_mutation_presence[sampleidx][mut_zbi]:
+            list_positive_sample_index.append(sampleidx)
+    
+    fw.write('"' + mut_def + ':","","",""' + "\n")
+
+    for list_zbi in range(len(list_positive_sample_index)):
+        sampleidx = list_positive_sample_index[list_zbi]
+        original_id = list_input_sample_original_id[sampleidx]
+        systematic_id = list_input_sample_systematic_id[sampleidx]
+        input_file = dict_sample_sysid_fasta_file_path[systematic_id]
+        fw.write('"","' + original_id + '","' + systematic_id + '","' + input_file + '"' + "\n")
+
+fw.close()

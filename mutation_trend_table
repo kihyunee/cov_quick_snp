@@ -1,0 +1,651 @@
+#!/usr/bin/python3
+
+import os
+import argparse
+import subprocess
+from datetime import datetime, date, timedelta
+
+
+"""
+Check if environment works.
+"""
+if 'COV_PKG_BASE' not in os.environ:
+    print("You don't have environmental variable 'COV_PKG_BASE'")
+    print("Add the following line to your ~/.bashrc file:")
+    print("export COV_PKG_BASE=/path/to/package_v1")
+    print("(where the /path/to/package_v1 part should be changed to the full-path to the directory 'package_v1' in your file system)")
+
+    quit()
+
+cov_package_base_dir = os.environ['COV_PKG_BASE']
+
+sys_path_to_r_script = os.path.join(cov_package_base_dir, 'dependency', 'bin', 'mutation_trend_plot_R_script')
+
+
+parser = argparse.ArgumentParser(description = "")
+parser.add_argument("--sample-date", dest="sample_date_csv_file", required=True, type=str, help="CSV file containing first column: isolate ID, second column: collection date in 'YYYY-MM-DD' format. DO NOT have header row (DO NOT HAVE first row for column titles)")
+parser.add_argument("--sample-record", dest="sample_record_csv_file", required=True, type=str, help="CSV file containing the rows from '*.sample_record.csv' files that were generated from 'quick_corona_mut' program")
+parser.add_argument("--interval-type", dest="interval_is_week_or_month", required=True, type=str, help="Define date intervals in weekly or monthly unit? Available values = 'week' or 'month'")
+parser.add_argument("--week-start", dest="week_starting_day", required=False, default = 'mon', type=str, help="If you are using --interval-type week; (default is mon); pick the starting day of weeks among 'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'")
+parser.add_argument("--min-sample", dest="week_min_sample_size", required=False, default=10, type=int, help="Minimal sample size per week, for a week to be shown in the plots (default = 10)")
+parser.add_argument("--min-observation", dest="min_observations_to_valid", required=False, default=10, type=float, help="Min. number of times the same mutation X is observed (repeatedly) to consider the mutation as an existing mutation rather than a spurious observation; Default = 10")
+parser.add_argument("--out", dest="output_csv_file_prefix", required=True, type=str, help="Prefix for the output CSV files. It will create PREFIX.mut_freq.csv, PREFIX.mut_sample.csv, PREFIX.mut_by_week/month.csv")
+args = parser.parse_args()
+
+sample_date_csv_file = args.sample_date_csv_file
+sample_record_csv_file = args.sample_record_csv_file
+interval_is_week_or_month = args.interval_is_week_or_month
+week_starting_day = args.week_starting_day
+week_min_sample_size = args.week_min_sample_size
+min_observations_to_valid = args.min_observations_to_valid
+output_csv_file_prefix = args.output_csv_file_prefix
+
+output_csv_gross_freq = output_csv_file_prefix + '.mut_freq.csv'
+output_csv_mut_sample = output_csv_file_prefix + '.mut_sample_list.csv'
+output_csv_freq_by_intv = output_csv_file_prefix + '.mut_freq_pct.by_' + interval_is_week_or_month + '.csv'
+
+
+dict_weekday_str_to_index = {}
+dict_weekday_str_to_index['mon'] = 0;   dict_weekday_str_to_index['Mon'] = 0;
+dict_weekday_str_to_index['tue'] = 1;   dict_weekday_str_to_index['Tue'] = 1;
+dict_weekday_str_to_index['wed'] = 2;   dict_weekday_str_to_index['Wed'] = 2;
+dict_weekday_str_to_index['thu'] = 3;   dict_weekday_str_to_index['Thu'] = 3;
+dict_weekday_str_to_index['fri'] = 4;   dict_weekday_str_to_index['Fri'] = 4;
+dict_weekday_str_to_index['sat'] = 5;   dict_weekday_str_to_index['Sat'] = 5;
+dict_weekday_str_to_index['sun'] = 6;   dict_weekday_str_to_index['Sun'] = 6;
+
+week_starting_dayindex = 0
+if interval_is_week_or_month == 'week':
+    if week_starting_day in dict_weekday_str_to_index:
+        week_starting_dayindex = dict_weekday_str_to_index[week_starting_day]
+    else:
+        print("Weekday starting point (--week-start) is invalid. Available options = mon, tue, wed, thu, fri, sat, sun")
+        quit()
+
+temp_mut_sam_outdir = output_csv_file_prefix + '_mutsam_temp'
+if not os.path.isdir(temp_mut_sam_outdir):
+    os.makedirs(temp_mut_sam_outdir)
+
+
+
+"""
+1. Collect the samples for which the collection date was validly presented in YYYY-MM-DD format
+"""
+list_isolate_id = []
+dict_isolate_id_collection_date = {}
+n_valid_isolate_in_input_csv = 0
+n_total_isolate_in_input_csv = 0
+earliest_collection_date = date(2099, 12, 31)
+latest_collection_date = date(1900, 1, 1)
+
+fr = open(sample_date_csv_file, 'r')
+for line in fr:
+    fields = line.strip().split(',')
+    isolate_id = fields[0].strip('"')
+    collection_date_str = fields[1].strip('"')
+    collection_date_split = collection_date_str.split('-')
+    valid_date_str = True
+    n_total_isolate_in_input_csv += 1
+
+    if len(collection_date_split) != 3:
+        valid_date_str = False
+        continue
+    if len(collection_date_split[0]) != 4:
+        valid_date_str = False
+        continue
+    if len(collection_date_split[1]) > 2 or int(collection_date_split[1]) > 12:
+        valid_date_str = False
+        continue
+    if len(collection_date_split[2]) > 2:
+        valid_date_str = False
+        continue
+    
+    n_valid_isolate_in_input_csv += 1
+    collection_date_y = int(collection_date_split[0])
+    collection_date_m = int(collection_date_split[1])
+    collection_date_d = int(collection_date_split[2])
+    collection_date = date(collection_date_y, collection_date_m, collection_date_d)
+
+    list_isolate_id.append(isolate_id)
+    dict_isolate_id_collection_date[isolate_id] = collection_date
+
+    if collection_date < earliest_collection_date:
+        earliest_collection_date = collection_date
+    if collection_date > latest_collection_date:
+        latest_collection_date = collection_date
+
+fr.close()
+
+print("Samples recieved from the input CSV file " + sample_date_csv_file)
+print("  ... number of isolates included in file = " + str(n_total_isolate_in_input_csv))
+print("  ... number of isoaltes with valid collection date info = " + str(n_valid_isolate_in_input_csv))
+print("  ... earliest collection date = " + earliest_collection_date.isoformat())
+print("  ... latest collection date = " + latest_collection_date.isoformat())
+
+
+
+"""
+2. Among the isolates provided with collection date,
+    sort out the ones whose 'quick_corona_mut' output paths are provided in the --sample-record CSV file
+"""
+dict_isolate_id_mutation_table_path = {}
+dict_isolate_id_ambig_pos_file_path = {}
+n_valid_isolate_with_mutation_table = 0
+
+fr = open(sample_record_csv_file, 'r')
+# pass the header row
+line = fr.readline()
+
+for line in fr:
+    fields = line.strip().split(',')
+
+    isolate_id = fields[0].strip('"')
+    mutation_table_path = fields[4].strip('"')
+    ambig_pos_file_path = mutation_table_path[:-3] + "ambigpos"
+
+    if not os.path.isfile(mutation_table_path):
+        # CANNOT BE USED case: because the mutation table promised in the sample-record CSV table is not found
+        print("  ...  ... FAILS to MATCH due to mutation table path NOT FOUND: " + mutation_table_path)
+        continue
+
+    if not os.path.isfile(ambig_pos_file_path):
+        # CANNOT BE USED case: because the ambiguous base reference coordinates file promised from the quick_corona_mutation run is not found
+        print("  ...  ... FAILS to MATCH due to mutation table path NOT FOUND: " + ambig_pos_file_path)
+        continue
+
+    if isolate_id not in dict_isolate_id_collection_date:
+        # CANNOT BE USED case: because the collection date for the isolate was not provided in --sample-date CSV file
+        print("  ...  ... FAILS to MATCH due isolate collection date NOT PROVIDED: " + isolate_id)
+        continue
+
+    n_valid_isolate_with_mutation_table += 1
+    dict_isolate_id_mutation_table_path[isolate_id] = mutation_table_path
+    dict_isolate_id_ambig_pos_file_path[isolate_id] = ambig_pos_file_path
+fr.close()
+
+print("MATCHING the samples provided with collection dates WITH the sample's mutation profile table information provided in: " + sample_record_csv_file)
+print("  ... number of isolates with validly matched mutation profile file = " + str(n_valid_isolate_with_mutation_table) + '/' + str(n_valid_isolate_in_input_csv))
+
+
+
+"""
+3. Sorting the collection date range into the weekly intervals; 
+    and map each isolate ID to the corresponding week index
+"""
+list_intv_starting_date = []
+#dict_weekstart_datestr_to_weekindex = {}
+if interval_is_week_or_month == 'week':
+    buff_intv_start_date = earliest_collection_date
+    for deltadays in range(7):
+        buff_intv_start_date = earliest_collection_date - timedelta(days = deltadays)
+        if buff_intv_start_date.weekday() == week_starting_dayindex:
+            break
+    while buff_intv_start_date <= latest_collection_date:
+        list_intv_starting_date.append(buff_intv_start_date)
+        buff_intv_start_date += timedelta(days = 7)
+
+else:   # interval_is_week_or_month == 'month'
+    fixed_last_monthstart = latest_collection_date.replace(day = 1)
+    earliest_date_split = earliest_collection_date.isoformat().split('-')
+    buff_y = int(earliest_date_split[0])
+    buff_m = int(earliest_date_split[1])
+    buff_d = 1
+    buff_intv_start_date = date(buff_y, buff_m, buff_d)
+    while buff_intv_start_date <= fixed_last_monthstart:
+        list_intv_starting_date.append(buff_intv_start_date)
+
+        buff_m += 1
+        if buff_m > 12:
+            buff_m = 1
+            buff_y += 1
+        buff_intv_start_date = date(buff_y, buff_m, buff_d)
+#
+
+
+n_total_interval = len(list_intv_starting_date)
+if interval_is_week_or_month == 'week':
+    print("Number of weekly intervals to cover from " + earliest_collection_date.isoformat() + " to " + latest_collection_date.isoformat() + " = " + str(n_total_interval))
+else:
+    print("Number of monthly intervals to cover from " + earliest_collection_date.isoformat() + " to " + latest_collection_date.isoformat() + " = " + str(n_total_interval))
+
+
+
+"""
+After counting up the number of isolates per weekly interval USING ONLY the isolates VALIDLY provided with mutation table and collection date, 
+the effective weekly intervals can be smaller than the whole range.
+"""
+list_intv_sample_count = [0]*n_total_interval
+dict_isolate_id_intv_index = {}
+
+for isolate_index in range(len(list_isolate_id)):
+    isolate_id = list_isolate_id[isolate_index]
+    if isolate_id not in dict_isolate_id_mutation_table_path:
+        continue
+    if isolate_id not in dict_isolate_id_collection_date:
+        continue
+
+    isolate_collection_date = dict_isolate_id_collection_date[isolate_id]
+
+    # It doesn't matter if it's weekly charting or monthly charting.
+    # always, going from last interval to the earlier week/month intervals
+    #   the first encountering of isolate_collection_date >= interval starting date means that the sample belongs to that interval
+    assigned_intv_index = -1
+    for intv_index_subtr in range(1, n_total_interval + 1):
+        intv_index = n_total_interval - intv_index_subtr
+        if isolate_collection_date >= list_intv_starting_date[intv_index]:
+            assigned_intv_index = intv_index
+            break    
+    list_intv_sample_count[intv_index] += 1
+    dict_isolate_id_intv_index[isolate_id] = assigned_intv_index
+
+
+# How many intervals get enough number of samples to be shown in the plot?
+n_intv_to_plot = 0
+list_intv_is_plottable = [False]*n_total_interval
+
+for intv_index in range(n_total_interval):
+    if list_intv_sample_count[intv_index] >= week_min_sample_size:
+        n_intv_to_plot += 1
+        list_intv_is_plottable[intv_index] = True
+print("Number of intervals where we have enough samples (>= " + str(week_min_sample_size) + " samples) to show plot = " + str(n_intv_to_plot))
+
+
+
+"""
+Now collect all mutations in the plotting-eligible samples.
+"""
+dict_mut_def_feature = {}
+dict_mut_def_nobs = {}
+dict_mut_def_type = {}
+dict_mut_def_gcoord = {}
+dict_mut_def_gcoord_end = {}
+dict_mut_def_attribute = {}
+#   dict_mut_id_attribute: {mutation_id : [genomic_from, genomic_to, feature_name, locus_type, variant_type, amino_acid_position, ref_nt_allele, alt_nt_allele, ref_aa_allele, alt_aa_allele]}
+unfiltered_list_mut_def = []
+unfiltered_list_mut_gcoord = []
+for isolate_index in range(len(list_isolate_id)):
+    isolate_id = list_isolate_id[isolate_index]
+    if isolate_id not in dict_isolate_id_mutation_table_path:
+        continue
+    if isolate_id not in dict_isolate_id_collection_date:
+        continue
+
+    assigned_intv_index = dict_isolate_id_intv_index[isolate_id]
+    mutation_table_path = dict_isolate_id_mutation_table_path[isolate_id]
+    covcoord_table_path = mutation_table_path[:-3] + 'cov'
+    
+    fr = open(mutation_table_path, 'r')
+    # pass the header row
+    line = fr.readline()
+
+    for line in fr:
+        fields = line.strip().split("\t")
+
+        """
+        [0] mutation_def_code   [1] genomic_from    [2] genomic_to
+        [3] feature [4] amino_acid_position     [5] locus_type
+        [6] ref_nt_allele   [7] sample_nt_allele
+        [8] ref_aa_allele   [9] sample_aa_allele
+        [10] variant_type        
+        """
+        mut_def = fields[0]
+        genomic_from = fields[1]
+        genomic_to = fields[2]
+        feature_name = fields[3]
+        amino_position = fields[4]
+        locus_type = fields[5]
+        ref_nt = fields[6]
+        alt_nt = fields[7]
+        ref_aa = fields[8]
+        alt_aa = fields[9]
+        var_type = fields[10]
+        mut_attribute = [genomic_from, genomic_to, feature_name, locus_type, var_type, amino_position, ref_nt, alt_nt, ref_aa, alt_aa]
+
+        if mut_def not in dict_mut_def_feature:
+            dict_mut_def_feature[mut_def] = feature_name
+            dict_mut_def_gcoord[mut_def] = int(genomic_from)
+            dict_mut_def_gcoord_end[mut_def] = int(genomic_to)
+            dict_mut_def_type[mut_def] = var_type
+            dict_mut_def_attribute[mut_def] = mut_attribute
+            unfiltered_list_mut_def.append(mut_def)
+            unfiltered_list_mut_gcoord.append(int(genomic_from))
+
+        nobs = 0
+        if mut_def in dict_mut_def_nobs:
+            nobs = dict_mut_def_nobs[mut_def]
+        dict_mut_def_nobs[mut_def] = nobs + 1
+
+    fr.close()
+
+
+# Requires a mutation to be observed at least N times (10 by default) / otherwise considered as a spurious, insignificant observations
+filtered_list_mut_def = []
+filtered_list_mut_gcoord = []
+for mut_index in range(len(unfiltered_list_mut_def)):
+    if dict_mut_def_nobs[unfiltered_list_mut_def[mut_index]] >= min_observations_to_valid:
+        filtered_list_mut_def.append(unfiltered_list_mut_def[mut_index])
+        filtered_list_mut_gcoord.append(unfiltered_list_mut_gcoord[mut_index])
+
+
+# now sort by genomic coordinate
+zipped_lists = zip(filtered_list_mut_gcoord, filtered_list_mut_def)
+sorted_pairs = sorted(zipped_lists)
+tuples = zip(*sorted_pairs)
+sorted_list_mut_gcoord, sorted_list_mut_def = [ list(tuple) for tuple in  tuples]
+num_mut_def = len(sorted_list_mut_def)
+
+dict_mut_def_mut_index = {}
+dict_mut_index_gcoord = {}
+for mut_index in range(num_mut_def):
+    dict_mut_def_mut_index[sorted_list_mut_def[mut_index]] = mut_index
+    dict_mut_index_gcoord[mut_index] = sorted_list_mut_gcoord[mut_index]
+
+
+print("Collected all mutations found across all isolates.")
+print("  ... total number of different mutations = " + str(num_mut_def))
+
+
+
+"""
+4. Then for each mutation, find the maximum peak of weekly frequency across all date intervals.
+-   in order to filter out the ones that never reach the threshold frequency 
+
+While doing that, WRITE in TEMPORARY FILES (a file per mutation def) the list of samples in which the mutation def occurred in; 
+    Later to write in the occurring sample csv file.
+"""
+# Create 2-Dimensional count arrays of 
+# (1) mutation occurence count per week/month interval
+#   [sorted mutation index][week index among total week intervals] = number of positive sample for that mutation for that week
+# (2) alignment coverage observation pool size (count sequences) per mutation site per week/month interval
+# then adjust the observation pool size (list_mut_list_poolsize_by_intv) by eliminating the case counts where the given muation genomic position was covered by ambiguous base
+list_mut_list_nobs_by_intv = []
+list_mut_list_poolsize_by_intv = []
+for mut_index in range(num_mut_def):
+    list_mut_list_nobs_by_intv.append([0]*n_total_interval)
+    list_mut_list_poolsize_by_intv.append([0]*n_total_interval)
+    mut_sample_list_temp_file = os.path.join(temp_mut_sam_outdir , str(mut_index) + '.samples.tmp')
+    if os.path.isfile(mut_sample_list_temp_file):
+        os.remove(mut_sample_list_temp_file)
+
+for isolate_index in range(len(list_isolate_id)):
+    isolate_id = list_isolate_id[isolate_index]
+    if isolate_id not in dict_isolate_id_mutation_table_path:
+        continue
+    if isolate_id not in dict_isolate_id_collection_date:
+        continue
+
+    assigned_intv_index = dict_isolate_id_intv_index[isolate_id]
+    mutation_table_path = dict_isolate_id_mutation_table_path[isolate_id]
+    covcoord_table_path = mutation_table_path[:-3] + 'cov'
+    ambig_pos_file_path = dict_isolate_id_ambig_pos_file_path[isolate_id]
+
+    # observed mutations
+    fr = open(mutation_table_path, 'r')
+    # pass the header row
+    line = fr.readline()
+    for line in fr:
+        fields = line.strip().split("\t")
+        mut_def = fields[0]
+        if mut_def in dict_mut_def_mut_index:
+            # otherwise the mutation was filtered out already 
+            # because it did not occur in > min observations times
+            mut_index = dict_mut_def_mut_index[mut_def]
+            list_mut_list_nobs_by_intv[mut_index][assigned_intv_index] += 1
+            mut_sample_list_temp_file = os.path.join(temp_mut_sam_outdir , str(mut_index) + '.samples.tmp')
+            fwa = open(mut_sample_list_temp_file, 'a')
+            fwa.write(isolate_id + "\n")
+            fwa.close()
+    fr.close()
+
+    # coverage presence/absence per each mutation's genomic coordinate
+    global_aln_start = 999999999
+    global_aln_end = -1
+    fr = open(covcoord_table_path, 'r')
+    for line in fr:
+        fields = line.strip().split("\t")
+        ref_seqid = fields[0]
+        ref_from = int(fields[1])
+        ref_to = int(fields[2])
+        cov_depth = int(fields[3])
+
+        if cov_depth == 0:
+            continue
+        
+        if ref_to > global_aln_end:
+            global_aln_end = ref_to
+        if ref_from < global_aln_start:
+            global_aln_start = ref_from
+        
+        for mut_index in range(num_mut_def):
+            mut_type = dict_mut_def_type[sorted_list_mut_def[mut_index]]
+            if mut_type == 'Insertion':
+                continue
+            if mut_type == 'Deletion':
+                continue
+            genomic_coord = sorted_list_mut_gcoord[mut_index]
+            if genomic_coord >= ref_from:
+                if genomic_coord <= ref_to:
+                    list_mut_list_poolsize_by_intv[mut_index][assigned_intv_index] += 1
+    fr.close()
+
+    for mut_index in range(num_mut_def):
+        mut_type = dict_mut_def_type[sorted_list_mut_def[mut_index]]
+        if (mut_type == 'Insertion') or (mut_type == 'Deletion'):
+            genomic_coord = sorted_list_mut_gcoord[mut_index]
+            if genomic_coord >= global_aln_start:
+                if genomic_coord <= global_aln_end:
+                    list_mut_list_poolsize_by_intv[mut_index][assigned_intv_index] += 1
+
+    dict_ambig_base_genomic_pos = {}
+    fr = open(ambig_pos_file_path, 'r')
+    for line in fr:
+        dict_ambig_base_genomic_pos[int(line.strip())] = True
+    fr.close()
+
+    for mut_index in range(num_mut_def):
+        mut_def = sorted_list_mut_def[mut_index]
+        genomic_coord = sorted_list_mut_gcoord[mut_index]
+        genomic_coord_end = dict_mut_def_gcoord_end[mut_def]
+        for any_genomic_coord in range(genomic_coord, genomic_coord_end + 1):
+            if any_genomic_coord in dict_ambig_base_genomic_pos:
+                list_mut_list_poolsize_by_intv[mut_index][assigned_intv_index] -= 1
+                break
+        # if any of the mutation's positions (coulle be 1 for noncoding, 3 for coding region, or even >3 for indel variant) 
+        # had one or more ambiguous base 
+        # then we don't count it as a valide coverage
+
+
+list_mut_peak_freq = [0]*num_mut_def
+for mut_index in range(num_mut_def):
+    peaking_pct_freq = 0
+    for intv_index in range(n_total_interval):
+        if not list_intv_is_plottable[intv_index]:
+            continue
+
+        n_sample_in_the_intv = list_intv_sample_count[intv_index]
+        n_covered_sample_in_the_intv = list_mut_list_poolsize_by_intv[mut_index][intv_index]
+        n_positive_in_the_intv = list_mut_list_nobs_by_intv[mut_index][intv_index]
+
+        pct_freq_in_the_week = float("nan")
+        if n_covered_sample_in_the_intv > 0:
+            pct_freq_in_the_week = 100*float(n_positive_in_the_intv)/float(n_covered_sample_in_the_intv)
+            if pct_freq_in_the_week > peaking_pct_freq:
+                peaking_pct_freq = pct_freq_in_the_week
+    
+    list_mut_peak_freq[mut_index] = peaking_pct_freq
+
+
+
+"""
+5. Now write the parsed mutation frequencies into 
+(1) CSV output tables:
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!   TODO
+    CSV file - the gross frequency table
+    CSV file - mutation definition + list of isolate IDs
+    CSV file - the temporal trend matrix table
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!   TODO
+"""
+# 1. csv file for sample list per mutation 
+fw = open(output_csv_mut_sample, 'w')
+fw.write('"mutation definition","sample ID"' + "\n")
+for mut_index in range(num_mut_def):
+    mut_def = sorted_list_mut_def[mut_index]
+    mut_sample_list_temp_file = os.path.join(temp_mut_sam_outdir , str(mut_index) + '.samples.tmp')
+
+    fw.write('"' + mut_def + ':",""' + "\n")
+    
+    fr = open(mut_sample_list_temp_file, 'r')
+    for line in fr:
+        fw.write('"","' + line.strip() + '"' + "\n")
+    fr.close()
+fw.close()
+
+
+# 2. gross frequency per mutation
+fw = open(output_csv_gross_freq, 'w')
+fw.write('"mutation_definition","frequency_percent","n.samples.positive","n.samples.genotyped","genomic_from","genomic_to","coding_feature","locus_type","variant_type","amino_acid_position","ref_nt","alt_nt","ref_aa","alt_aa"' + "\n")
+for mut_index in range(num_mut_def):
+    mut_def = sorted_list_mut_def[mut_index]
+    mut_attribute = dict_mut_def_attribute[mut_def]
+    #   mut_attribute = [genomic_from, genomic_to, feature_name, locus_type, var_type, amino_position, ref_nt, alt_nt, ref_aa, alt_aa]
+
+    num_positive_sample_gross = 0
+    num_covered_sample_gross = 0
+    for intv_index in range(n_total_interval):
+        if not list_intv_is_plottable[intv_index]:
+            continue
+        num_covered_sample_gross += list_mut_list_poolsize_by_intv[mut_index][intv_index]
+        num_positive_sample_gross += list_mut_list_nobs_by_intv[mut_index][intv_index]
+    pct_freq = float(num_positive_sample_gross)*100/float(num_covered_sample_gross)
+    pct_freq_rounded = round(pct_freq, 2)
+
+    var_site_from = str(mut_attribute[0])
+    var_site_to = str(mut_attribute[1])
+    var_feature = mut_attribute[2]
+    var_locus_type = mut_attribute[3]
+    var_type = mut_attribute[4]
+    var_amino_pos = str(mut_attribute[5])
+    if mut_attribute[5] == '.':
+        var_amino_pos = 'NA'
+    var_ref_nt = mut_attribute[6]
+    var_alt_nt = mut_attribute[7]
+    var_ref_aa = mut_attribute[8]
+    var_alt_aa = mut_attribute[9]
+
+    #"mutation_definition","frequency_percent","n.samples.detected_in","n.samples.analyzed",
+    #  "genomic_from","genomic_to","coding_feature","locus_type","variant_type","amino_acid_position",
+    #  "ref_nt","alt_nt","ref_aa","alt_aa"')
+    fw.write('"' + mut_def + '",' + str(pct_freq_rounded) + '%' + ',' + str(num_positive_sample_gross) + ',' + str(num_covered_sample_gross))
+    fw.write(','+ var_site_from + ',' + var_site_to + ',"' + var_feature + '"')
+    fw.write(',"' + var_locus_type + '","' + var_type + '",' + var_amino_pos)
+    fw.write(',"' + var_ref_nt + '","' + var_alt_nt + '","' + var_ref_aa + '","' + var_alt_aa + '"')
+    fw.write("\n")
+fw.close()
+
+
+# 3. frequency per mutation by interval period
+fw = open(output_csv_freq_by_intv, 'w')
+fw.write('"mutation_definition"')
+for intv_index in range(n_total_interval):
+    if not list_intv_is_plottable[intv_index]:
+        continue
+    intv_starting_date_str = list_intv_starting_date[intv_index].isoformat()
+    intv_expression_str = ''
+    if interval_is_week_or_month == 'week':
+        intv_expression_str = 'week from ' + intv_starting_date_str
+    else:
+        intv_expression_str = 'month of ' + intv_starting_date_str[:intv_starting_date_str.rfind('-')]
+    fw.write(',"' + intv_expression_str + '"')
+fw.write("\n")
+
+for mut_index in range(num_mut_def):
+    mut_def = sorted_list_mut_def[mut_index]
+    fw.write('"' + mut_def + '"')
+    for intv_index in range(n_total_interval):
+        if not list_intv_is_plottable[intv_index]:
+            continue
+        num_covered_sample = list_mut_list_poolsize_by_intv[mut_index][intv_index]
+        num_positive_sample = list_mut_list_nobs_by_intv[mut_index][intv_index]
+        pct_freq = float("nan")
+        pct_freq_rounded = float("nan")
+        if num_covered_sample > 0:
+            pct_freq = float(num_positive_sample)*100/float(num_covered_sample)
+            pct_freq_rounded = round(pct_freq, 2)
+        fw.write(',' + str(pct_freq_rounded))
+    fw.write("\n")
+fw.close()
+
+
+
+
+
+"""
+From here on the followings are retired codes. Those retired code lines used to make 
+    a temporary file with the columns FOR R GGPLOT SCRIPT:
+        mutation index, mutation def, week start date, percent frequency, feature name
+    and another temporary file:
+        week start date, number of samples
+"""
+quit()
+
+tmp_plotdata_tsv_week_info = output_png_file_prefix + '.tmp_tsv_weekinfo'
+tmp_plotdata_tsv_mut_freq = output_png_file_prefix + '.tmp_tsv_mutfreq'
+
+fw = open(tmp_plotdata_tsv_week_info, 'w')
+fw.write("week_start\tn_sample\n")
+for intv_index in range(n_total_interval):
+    if list_intv_is_plottable[intv_index]:
+        intv_start_str = list_intv_starting_date[intv_index].isoformat()
+        intv_n_sample = list_intv_sample_count[intv_index]
+        fw.write(intv_start_str + "\t" + str(intv_n_sample) + "\n")
+fw.close()
+
+fw = open(tmp_plotdata_tsv_mut_freq, 'w')
+fw.write("mut_index\tmut_def\tweek_start\tpercent_freq\tfeature_name\ttype\tn_observed.positive\tn_observed.total\n")
+for mut_index in range(num_mut_def):
+    if not list_mut_is_plottable[mut_index]:
+        continue
+    mut_def = sorted_list_mut_def[mut_index]
+    mut_feature = dict_mut_def_feature[mut_def]
+    mut_type = dict_mut_def_type[mut_def]
+
+    for intv_index in range(n_total_interval):
+        if not list_intv_is_plottable[intv_index]:
+            continue
+        n_sample_in_the_intv = list_intv_sample_count[intv_index]
+        n_covered_sample_in_the_intv = list_mut_list_poolsize_by_intv[mut_index][intv_index]
+        n_positive_in_the_intv = list_mut_list_nobs_by_intv[mut_index][intv_index]
+        pct_freq_in_the_intv = 100*float(n_positive_in_the_intv)/float(n_covered_sample_in_the_intv)
+        
+        fw.write(str(mut_index) + "\t" + mut_def + "\t" + list_intv_starting_date[intv_index].isoformat() + "\t" + str(pct_freq_in_the_intv))
+        fw.write("\t" + mut_feature  + "\t" + mut_type + "\t" + str(n_positive_in_the_intv) + "\t" + str(n_covered_sample_in_the_intv) + "\n")
+fw.close()
+
+
+"""
+6. Run the R script that create plots from the above two temporary files
+"""
+
+# mutation_trend_plot_R_script USA_DC_DEC_to_MAY.trend_plot.tmp_tsv_weekinfo USA_DC_DEC_to_MAY.trend_plot.tmp_tsv_mutfreq USA_DC_DEC_to_MAY.trend_plot
+command_list = []
+command_list.append(sys_path_to_r_script)
+command_list.append(tmp_plotdata_tsv_week_info)
+command_list.append(tmp_plotdata_tsv_mut_freq)
+command_list.append(output_png_file_prefix)
+print("RUN R SCRIPT: " + ' '.join(command_list))
+subprocess.run(command_list)
+
+
+
+"""
+7. Clear the temporary files
+"""
+# os.remove(tmp_plotdata_tsv_mut_freq)
+# os.remove(tmp_plotdata_tsv_week_info)
+
+# for temp_mut_sample_list_files
+#   os remove temp_mut_sample_list_files
+
+
+
+
